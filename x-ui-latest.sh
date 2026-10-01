@@ -7,9 +7,18 @@ msg_ok()  { echo -e "\e[1;42m $1 \e[0m"; }
 msg_err() { echo -e "\e[1;41m $1 \e[0m"; }
 msg_inf() { echo -e "\e[1;34m$1\e[0m"; }
 
-echo; msg_inf '           ___    _   _   _  '
-msg_inf      ' \/ __ | |  | __ |_) |_) / \ '
-msg_inf      ' /\    |_| _|_   |   | \ \_/ '; echo
+echo;msg_inf '╔═══════════════════════════════════════════════════════════════════════════════════════════════════╗'
+msg_inf '║                                                                                                   ║'
+msg_inf '║  ██████╗ ██╗  ██╗     ██╗   ██╗██╗    ██████╗ ██████╗  ██████╗     ███╗   ███╗ █████╗ ██╗  ██╗    ║'
+msg_inf '║  ╚════██╗╚██╗██╔╝     ██║   ██║██║    ██╔══██╗██╔══██╗██╔═══██╗    ████╗ ████║██╔══██╗╚██╗██╔╝    ║'
+msg_inf '║   █████╔╝ ╚███╔╝█████╗██║   ██║██║    ██████╔╝██████╔╝██║   ██║    ██╔████╔██║███████║ ╚███╔╝     ║'
+msg_inf '║   ╚═══██╗ ██╔██╗╚════╝██║   ██║██║    ██╔═══╝ ██╔══██╗██║   ██║    ██║╚██╔╝██║██╔══██║ ██╔██╗     ║'
+msg_inf '║  ██████╔╝██╔╝ ██╗     ╚██████╔╝██║    ██║     ██║  ██║╚██████╔╝    ██║ ╚═╝ ██║██║  ██║██╔╝ ██╗    ║'
+msg_inf '║  ╚═════╝ ╚═╝  ╚═╝      ╚═════╝ ╚═╝    ╚═╝     ╚═╝  ╚═╝ ╚═════╝     ╚═╝     ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝    ║'
+msg_inf '║                                       ╔═════════════════════╗                                     ║'
+msg_inf '║═══════════════════════════════════════║ Forked by Keshmak68 ║═════════════════════════════════════║'
+msg_inf '║                                       ╚═════════════════════╝                                     ║'
+msg_inf '╚═══════════════════════════════════════════════════════════════════════════════════════════════════╝' echo
 
 # ─── Pre-flight checks ───────────────────────────────────────────────────────
 check_os() {
@@ -53,6 +62,19 @@ check_cpu
 XUIDB="/etc/x-ui/x-ui.db"
 GITHUB_RAW="https://raw.githubusercontent.com/mozaroc/3x-ui-pro/main"
 FAKE_SITE_COUNT=50
+
+# ─── Ports ───────────────────────────────────────────────────────────────────
+# PUBLIC_PORT is the only TLS port exposed to the world: nginx stream listens
+# here and splits traffic by SNI into the panel vhost and the REALITY inbound.
+PUBLIC_PORT=8443
+# REALITY_PORT is loopback-only and reached exclusively through that stream
+# (which supplies the PROXY header acceptProxyProtocol expects). It must NOT
+# collide with PUBLIC_PORT, hence 65535 — outside the 10000-59151 range the
+# random internal ports are drawn from.
+REALITY_PORT=65535
+# Panel vhost and REALITY decoy vhost — loopback-only, never published.
+WWW_PORT=7443
+REALITY_VHOST_PORT=9443
 
 # ─── Default argument values ─────────────────────────────────────────────────
 domain=""
@@ -234,7 +256,7 @@ install_packages() {
 # ─────────────────────────────────────────────────────────────────────────────
 get_ssl_certs() {
     systemctl stop nginx 2>/dev/null || true
-    fuser -k 80/tcp 80/udp 443/tcp 443/udp 2>/dev/null || true
+    fuser -k 80/tcp 80/udp ${PUBLIC_PORT}/tcp ${PUBLIC_PORT}/udp 2>/dev/null || true
 
     if [[ ${AUTODOMAIN} == *"y"* ]]; then
         local resolve_ok=true
@@ -285,7 +307,7 @@ configure_nginx() {
         http2_listen=" http2"
     fi
 
-    # SNI-based stream: reality → 8443, domain → 7443
+    # SNI-based stream: reality → 65535 (loopback-only), domain → 7443
     cat > /etc/nginx/stream-enabled/stream.conf <<EOF
 map \$ssl_preread_server_name \$sni_name {
     hostnames;
@@ -294,14 +316,14 @@ map \$ssl_preread_server_name \$sni_name {
     default              xray;
 }
 
-upstream xray { server 127.0.0.1:8443; }
-upstream www  { server 127.0.0.1:7443; }
+upstream xray { server 127.0.0.1:${REALITY_PORT}; }
+upstream www  { server 127.0.0.1:${WWW_PORT}; }
 
 server {
     proxy_protocol on;
     set_real_ip_from unix:;
-    listen     443;
-    listen     [::]:443;
+    listen     ${PUBLIC_PORT};
+    listen     [::]:${PUBLIC_PORT};
     proxy_pass \$sni_name;
     ssl_preread on;
 }
@@ -320,7 +342,9 @@ EOF
 server {
     listen 80;
     server_name ${domain} ${reality_domain};
-    return 301 https://\$host\$request_uri;
+    # Public TLS lives on :${PUBLIC_PORT} — an implicit https:// redirect would
+    # land the browser on the closed :443.
+    return 301 https://\$host:${PUBLIC_PORT}\$request_uri;
 }
 EOF
 
@@ -465,7 +489,7 @@ server {
     root /var/www/html/;
     real_ip_header proxy_protocol;
     set_real_ip_from 127.0.0.1;
-    # This vhost listens on 7443 behind the SNI stream (public port 443). Without
+    # This vhost listens on 7443 behind the SNI stream (public port 8443). Without
     # this, nginx bakes :7443 into redirect Location headers (return/error_page),
     # so browsers get sent to an unreachable port. Keep redirects relative.
     absolute_redirect off;
@@ -811,8 +835,8 @@ configure_xui_db() {
     emoji_flag=$(LC_ALL=en_US.UTF-8 curl -s --max-time 10 https://ipwho.is/ | jq -r '.flag.emoji' 2>/dev/null)
     [[ -z "$emoji_flag" || "$emoji_flag" == "null" ]] && emoji_flag="🌐"
 
-    local sub_uri="https://${domain}/${sub_path}/"
-    local json_uri="https://${domain}/${json_path}?name="
+    local sub_uri="https://${domain}:${PUBLIC_PORT}/${sub_path}/"
+    local json_uri="https://${domain}:${PUBLIC_PORT}/${json_path}?name="
 
     # Prepare short IDs for REALITY
     local shor
@@ -866,7 +890,7 @@ INSERT INTO "settings" ("key","value") VALUES ("datepicker",          'gregorian
 INSERT INTO "inbounds"
     ("user_id","up","down","total","remark","enable","expiry_time","listen","port","protocol","settings","stream_settings","tag","sniffing")
 VALUES (
-    '1','0','0','0','${emoji_flag} reality','1','0','','8443','vless',
+    '1','0','0','0','${emoji_flag} reality','1','0','127.0.0.1','${REALITY_PORT}','vless',
     '{
   "clients": [],
   "decryption": "none",
@@ -900,7 +924,7 @@ VALUES (
     "header": {"type":"none"}
   }
 }',
-    'inbound-8443',
+    'inbound-${REALITY_PORT}',
     '{"enabled":false,"destOverride":["http","tls","quic","fakedns"],"metadataOnly":false,"routeOnly":false}'
 );
 
@@ -996,13 +1020,13 @@ VALUES (
 -- Hosts supersede the legacy externalProxy arrays: one host per inbound,
 -- rendered as the share-link endpoint at subscription time.
 -- REALITY keeps its own TLS params (security=same); the rest front through
--- nginx at :443 with TLS.
+-- nginx at :${PUBLIC_PORT} with TLS.
 INSERT INTO "hosts" ("inbound_id",${gid_col}"sort_order","remark","address","port","security","fingerprint","alpn")
 VALUES
-    ((SELECT id FROM inbounds WHERE tag='inbound-8443'),           ${gid_reality} 0, 'reality', '${domain}', 443, 'same', '',        '[]'),
-    ((SELECT id FROM inbounds WHERE tag='inbound-${ws_port}'),     ${gid_ws}      0, 'ws',      '${domain}', 443, 'tls',  'firefox', '["h2","http/1.1"]'),
-    ((SELECT id FROM inbounds WHERE tag='inbound-/dev/shm/uds2023.sock,0666:0|'), ${gid_xhttp} 0, 'xhttp', '${domain}', 443, 'tls', 'firefox', '["h2","http/1.1"]'),
-    ((SELECT id FROM inbounds WHERE tag='inbound-${trojan_port}'), ${gid_trojan}  0, 'trojan',  '${domain}', 443, 'tls',  'firefox', '["h2","http/1.1"]');
+    ((SELECT id FROM inbounds WHERE tag='inbound-${REALITY_PORT}'), ${gid_reality} 0, 'reality', '${domain}', ${PUBLIC_PORT}, 'same', '',        '[]'),
+    ((SELECT id FROM inbounds WHERE tag='inbound-${ws_port}'),     ${gid_ws}      0, 'ws',      '${domain}', ${PUBLIC_PORT}, 'tls',  'firefox', '["h2","http/1.1"]'),
+    ((SELECT id FROM inbounds WHERE tag='inbound-/dev/shm/uds2023.sock,0666:0|'), ${gid_xhttp} 0, 'xhttp', '${domain}', ${PUBLIC_PORT}, 'tls', 'firefox', '["h2","http/1.1"]'),
+    ((SELECT id FROM inbounds WHERE tag='inbound-${trojan_port}'), ${gid_trojan}  0, 'trojan',  '${domain}', ${PUBLIC_PORT}, 'tls',  'firefox', '["h2","http/1.1"]');
 EOF
 
     /usr/local/x-ui/x-ui setting \
@@ -1028,6 +1052,10 @@ install_clash_sub() {
         # Substitute domain and sub_path; leave ${EMAIL} for mtr-backend to fill per-request
         sed -i "s|\${DOMAIN}|${domain}|g"     "${clash_dir}/clash.yaml.tpl"
         sed -i "s|\${SUB_PATH}|${sub_path}|g" "${clash_dir}/clash.yaml.tpl"
+        # The template's proxy-provider URL is port-less (implicit :443), which is
+        # closed. Pin our own https:// links to the public port; third-party URLs
+        # (gstatic, jsdelivr, rule providers) must stay untouched.
+        sed -i "s|https://${domain}/|https://${domain}:${PUBLIC_PORT}/|g" "${clash_dir}/clash.yaml.tpl"
         chown -R www-data:www-data "${clash_dir}" 2>/dev/null || true
         chmod 644 "${clash_dir}/clash.yaml.tpl"
         msg_ok "Clash subscription template installed."
@@ -1143,7 +1171,7 @@ EOF
     systemctl enable mtr-backend
     systemctl restart mtr-backend
 
-    msg_ok "Network diagnostics installed at https://${domain}/${panel_path}/diag (panel login required)"
+    msg_ok "Network diagnostics installed at https://${domain}:${PUBLIC_PORT}/${panel_path}/diag (panel login required)"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1186,8 +1214,12 @@ setup_firewall() {
     ufw disable
     ufw allow 22/tcp
     ufw allow 80/tcp
-    ufw allow 443/tcp
-    ufw allow 443/udp
+    ufw allow ${PUBLIC_PORT}/tcp
+    ufw allow ${PUBLIC_PORT}/udp
+    # 443 is no longer served. "ufw disable" only flips the switch — the old
+    # rules survive it, so drop them explicitly or 443 stays open.
+    ufw --force delete allow 443/tcp 2>/dev/null || true
+    ufw --force delete allow 443/udp 2>/dev/null || true
     ufw --force enable
 }
 
@@ -1199,11 +1231,11 @@ show_results() {
     if systemctl is-active --quiet x-ui; then
         printf '0\n' | x-ui | grep --color=never -i ':'
         msg_inf "────────────────────────────────────────────────────────────────────────────────"
-        msg_inf "X-UI Secure Panel: https://${domain}/${panel_path}/\n"
+        msg_inf "X-UI Secure Panel: https://${domain}:${PUBLIC_PORT}/${panel_path}/\n"
         echo -e "Username:  ${config_username}\n"
         echo -e "Password:  ${config_password}\n"
         msg_inf "────────────────────────────────────────────────────────────────────────────────"
-        msg_inf "Network Diagnostics (panel login required): https://${domain}/${panel_path}/diag\n"
+        msg_inf "Network Diagnostics (panel login required): https://${domain}:${PUBLIC_PORT}/${panel_path}/diag\n"
         msg_inf "────────────────────────────────────────────────────────────────────────────────"
         msg_inf "Please save this screen!"
     else
