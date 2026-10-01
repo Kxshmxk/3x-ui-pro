@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # x-ui-patch.sh — apply current features to an existing 3x-ui installation
 #
-# What it does (non-destructively, no DB changes):
+# What it does (non-destructively, except for the port migration below):
 #   1. Reads ports/paths from /etc/x-ui/x-ui.db
 #   2. Detects domains from existing nginx configs
-#   3. Regenerates all nginx configs
-#   4. Installs network diagnostics (MTR + speed test)
-#   5. Installs Clash subscription template (UA-based routing)
-#   6. Replaces fake cover site with a current one
+#   3. Migrates the public TLS port 443 → 8443 and the REALITY inbound 8443 → 65535
+#   4. Regenerates all nginx configs
+#   5. Installs network diagnostics (MTR + speed test)
+#   6. Installs Clash subscription template (UA-based routing)
+#   7. Replaces fake cover site with a current one
 #
 # Usage:
 #   wget -qO x-ui-patch.sh https://raw.githubusercontent.com/mozaroc/3x-ui-pro/main/x-ui-patch.sh
@@ -19,6 +20,16 @@ GITHUB_RAW="https://raw.githubusercontent.com/mozaroc/3x-ui-pro/main"
 FAKE_SITE_COUNT=50
 LIB_DIR="/usr/local/lib/3x-ui-pro"
 DIAG_ROOT="/var/www/diagnostics"
+
+# ── ports (must match x-ui-latest.sh) ─────────────────────────────────────────
+# PUBLIC_PORT is the only TLS port exposed to the world; nginx stream splits by
+# SNI into the panel vhost (WWW_PORT) and the REALITY inbound (REALITY_PORT).
+PUBLIC_PORT=8443
+REALITY_PORT=65535
+WWW_PORT=7443
+REALITY_VHOST_PORT=9443
+OLD_PUBLIC_PORT=443
+OLD_REALITY_PORT=8443
 
 # ── colour helpers ────────────────────────────────────────────────────────────
 red()   { printf '\033[31m%s\033[0m\n' "$*"; }
@@ -69,15 +80,15 @@ fi
 for f in /etc/nginx/sites-available/*; do
     [[ -f "$f" ]] || continue
     case "$(basename "$f")" in 80.conf|00-maps.conf) continue;; esac
-    if grep -q 'listen 7443' "$f" 2>/dev/null; then
+    if grep -q "listen ${WWW_PORT}" "$f" 2>/dev/null; then
         [[ -z "$domain" ]] && domain=$(awk '/server_name/{print $2; exit}' "$f" | tr -d ';')
-    elif grep -q 'listen 9443' "$f" 2>/dev/null; then
+    elif grep -q "listen ${REALITY_VHOST_PORT}" "$f" 2>/dev/null; then
         reality_domain=$(awk '/server_name/{print $2; exit}' "$f" | tr -d ';')
     fi
 done
 
-[[ -n "$domain" ]]         || die "Could not determine panel domain (no webCertFile, no vhost with 'listen 7443')"
-[[ -n "$reality_domain" ]] || die "Could not find reality domain (nginx config with 'listen 9443')"
+[[ -n "$domain" ]]         || die "Could not determine panel domain (no webCertFile, no vhost with 'listen ${WWW_PORT}')"
+[[ -n "$reality_domain" ]] || die "Could not find reality domain (nginx config with 'listen ${REALITY_VHOST_PORT}')"
 printf "    domain         = %s\n" "$domain"
 printf "    reality_domain = %s\n" "$reality_domain"
 
@@ -192,6 +203,74 @@ apt-get update -qq
 DEBIAN_FRONTEND=noninteractive apt-get install -y -q mtr-tiny python3 curl wget sqlite3
 
 # ─────────────────────────────────────────────────────────────────────────────
+# PORT MIGRATION  443 → 8443 (public) / 8443 → 65535 (REALITY)
+# ─────────────────────────────────────────────────────────────────────────────
+# Two hard couplings force this to touch the DB:
+#   1. x-ui currently owns 8443 for the REALITY inbound, so nginx cannot bind
+#      :8443 as the new public front until that inbound moves away.
+#   2. The hosts table supplies the port rendered into every share link, so its
+#      rows must follow the new public port or every client config goes dead.
+# x-ui must be stopped first — it caches settings in memory and would overwrite
+# the edits on shutdown.
+blue "Migrating ports (public ${OLD_PUBLIC_PORT} → ${PUBLIC_PORT}, REALITY ${OLD_REALITY_PORT} → ${REALITY_PORT})..."
+
+reality_port_now=$(db "SELECT port FROM inbounds
+                           WHERE json_extract(stream_settings,'\$.security')='reality'
+                           LIMIT 1;" 2>/dev/null || true)
+if [[ "$reality_port_now" == "$REALITY_PORT" ]]; then
+    # Idempotent path: the inbound is already moved. The SQL below still runs and
+    # still fixes up hosts/subURI, so re-patching stays safe.
+    blue "  REALITY inbound already on ${REALITY_PORT}."
+elif [[ "$reality_port_now" != "$OLD_REALITY_PORT" ]]; then
+    red "WARNING: REALITY inbound is on an unexpected port (${reality_port_now:-none}), expected ${OLD_REALITY_PORT}."
+    red "         Migrating it to ${REALITY_PORT} anyway; check the REALITY link afterwards."
+fi
+
+has_hosts_table=$(db "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='hosts';")
+[[ "$has_hosts_table" == "1" ]] || red "NOTE: no hosts table in this 3x-ui version — share-link ports left as they are."
+
+# Built as a variable rather than inline in the argument: the hosts UPDATE only
+# exists on newer panels, and a bare command substitution in an argument list is
+# an easy way to trip set -e.
+migration_sql="BEGIN;
+UPDATE inbounds
+   SET port='${REALITY_PORT}',
+       tag='inbound-${REALITY_PORT}',
+       listen='127.0.0.1'
+ WHERE json_extract(stream_settings,'\$.security')='reality'
+   AND (port='${OLD_REALITY_PORT}' OR port='${REALITY_PORT}');"
+if [[ "$has_hosts_table" == "1" ]]; then
+    migration_sql+="UPDATE hosts SET port='${PUBLIC_PORT}' WHERE port='${OLD_PUBLIC_PORT}';"
+fi
+migration_sql+="UPDATE settings SET value='https://${domain}:${PUBLIC_PORT}/${sub_path}/'  WHERE key='subURI';
+UPDATE settings SET value='https://${domain}:${PUBLIC_PORT}/${json_path}?name=' WHERE key='subJsonURI';
+COMMIT;"
+
+systemctl stop x-ui 2>/dev/null || x-ui stop 2>/dev/null || true
+sleep 2
+
+if ! sqlite3 -bail "$XUIDB" "$migration_sql"; then
+    # Put x-ui back on the old config rather than leaving the panel down.
+    systemctl start x-ui 2>/dev/null || x-ui start 2>/dev/null || true
+    die "Port migration SQL failed — x-ui restarted on the old ports, nothing else changed."
+fi
+
+systemctl start x-ui 2>/dev/null || x-ui start 2>/dev/null || true
+sleep 3
+
+# xray still holding 8443 would silently keep nginx off the new public port:
+# "nginx -t" passes regardless, and the bind only fails at reload time, leaving
+# the old config live and the migration looking successful. Probe the port with
+# python3 (guaranteed above) rather than nc, which this script never installs.
+if python3 -c "import socket,sys
+s=socket.socket(); s.settimeout(2)
+sys.exit(0 if s.connect_ex(('127.0.0.1', ${REALITY_PORT}))==0 else 1)" 2>/dev/null; then
+    green "  x-ui listening on 127.0.0.1:${REALITY_PORT} — port is free for nginx."
+else
+    die "x-ui is not listening on 127.0.0.1:${REALITY_PORT} after migration — nginx cannot bind :${PUBLIC_PORT}. Check 'journalctl -u x-ui -n 50'."
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
 # NGINX CONFIGS
 # ─────────────────────────────────────────────────────────────────────────────
 blue "Regenerating nginx configs..."
@@ -218,14 +297,14 @@ map \$ssl_preread_server_name \$sni_name {
     default              xray;
 }
 
-upstream xray { server 127.0.0.1:8443; }
-upstream www  { server 127.0.0.1:7443; }
+upstream xray { server 127.0.0.1:${REALITY_PORT}; }
+upstream www  { server 127.0.0.1:${WWW_PORT}; }
 
 server {
     proxy_protocol on;
     set_real_ip_from unix:;
-    listen     443;
-    listen     [::]:443;
+    listen     ${PUBLIC_PORT};
+    listen     [::]:${PUBLIC_PORT};
     proxy_pass \$sni_name;
     ssl_preread on;
 }
@@ -244,7 +323,9 @@ cat > /etc/nginx/sites-available/80.conf <<EOF
 server {
     listen 80;
     server_name ${domain} ${reality_domain};
-    return 301 https://\$host\$request_uri;
+    # Public TLS lives on :${PUBLIC_PORT} — an implicit https:// redirect would
+    # land the browser on the closed :443.
+    return 301 https://\$host:${PUBLIC_PORT}\$request_uri;
 }
 EOF
 
@@ -377,14 +458,14 @@ map \$cookie_diag_key \$diag_auth {
 server {
     server_tokens off;
     server_name ${domain};
-    listen 7443 ssl${http2_listen} proxy_protocol;
-    listen [::]:7443 ssl${http2_listen} proxy_protocol;
+    listen ${WWW_PORT} ssl${http2_listen} proxy_protocol;
+    listen [::]:${WWW_PORT} ssl${http2_listen} proxy_protocol;
     ${http2_on}
     index index.html index.htm index.php;
     root /var/www/html/;
     real_ip_header proxy_protocol;
     set_real_ip_from 127.0.0.1;
-    # This vhost listens on 7443 behind the SNI stream (public port 443). Without
+    # This vhost listens on 7443 behind the SNI stream (public port 8443). Without
     # this, nginx bakes :7443 into redirect Location headers (return/error_page),
     # so browsers get sent to an unreachable port. Keep redirects relative.
     absolute_redirect off;
@@ -547,8 +628,8 @@ cat > "/etc/nginx/sites-available/${reality_domain}" <<EOF
 server {
     server_tokens off;
     server_name ${reality_domain};
-    listen 9443 ssl${http2_listen};
-    listen [::]:9443 ssl${http2_listen};
+    listen ${REALITY_VHOST_PORT} ssl${http2_listen};
+    listen [::]:${REALITY_VHOST_PORT} ssl${http2_listen};
     ${http2_on}
     index index.html index.htm index.php;
     root /var/www/html/;
@@ -591,7 +672,7 @@ for f in /etc/nginx/sites-available/*; do
     [[ -f "$f" ]] || continue
     bn=$(basename "$f")
     case "$bn" in 80.conf|00-maps.conf|"$domain"|"$reality_domain") continue;; esac
-    if grep -qE 'listen (7443|9443)' "$f" 2>/dev/null; then
+    if grep -qE "listen (${WWW_PORT}|${REALITY_VHOST_PORT})" "$f" 2>/dev/null; then
         blue "Removing stale vhost: $bn"
         rm -f "$f"
     fi
@@ -697,6 +778,10 @@ mkdir -p "$clash_dir"
 if curl -fsSL "${GITHUB_RAW}/assets/clash/clash.yaml" -o "${clash_dir}/clash.yaml.tpl"; then
     sed -i "s|\${DOMAIN}|${domain}|g"     "${clash_dir}/clash.yaml.tpl"
     sed -i "s|\${SUB_PATH}|${sub_path}|g" "${clash_dir}/clash.yaml.tpl"
+    # The template's proxy-provider URL is port-less (implicit :443), which is
+    # closed. Pin our own https:// links to the public port; third-party URLs
+    # (gstatic, jsdelivr, rule providers) must stay untouched.
+    sed -i "s|https://${domain}/|https://${domain}:${PUBLIC_PORT}/|g" "${clash_dir}/clash.yaml.tpl"
     chown -R www-data:www-data "$clash_dir"
     chmod 644 "${clash_dir}/clash.yaml.tpl"
     green "Clash template installed."
@@ -742,7 +827,7 @@ echo
 green "══════════════════════════════════════════════"
 green " Patch complete"
 green "══════════════════════════════════════════════"
-printf "\n  Panel:       https://%s/%s/\n"  "$domain" "$panel_path"
-printf "  Diagnostics (panel login): https://%s/%s/diag\n"  "$domain" "$panel_path"
-printf "  Diagnostics (direct):      https://%s%s\n"  "$domain" "$diag_path"
+printf "\n  Panel:       https://%s:%s/%s/\n"  "$domain" "$PUBLIC_PORT" "$panel_path"
+printf "  Diagnostics (panel login): https://%s:%s/%s/diag\n"  "$domain" "$PUBLIC_PORT" "$panel_path"
+printf "  Diagnostics (direct):      https://%s:%s%s\n"  "$domain" "$PUBLIC_PORT" "$diag_path"
 echo
